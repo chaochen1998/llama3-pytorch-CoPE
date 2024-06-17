@@ -42,52 +42,80 @@ class RMSNorm(torch.nn.Module):
         # (dim) * (B, seq_len, dim) --> (B, seq_len, dim)
         return output * self.weight
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
-    """ Precomputing the frequency tensor with complex exponentials 
-        for the given sequence length and dimensions
-    """
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device, dtype=torch.float32)
-    freqs = torch.outer(t, freqs).float() 
-    freqs_cos = torch.cos(freqs)
-    freqs_sin = torch.sin(freqs)
-    return freqs_cos, freqs_sin
+# RoPE
+# def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
+#     """ Precomputing the frequency tensor with complex exponentials 
+#         for the given sequence length and dimensions
+#     """
+#     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+#     t = torch.arange(end, device=freqs.device, dtype=torch.float32)
+#     freqs = torch.outer(t, freqs).float() 
+#     freqs_cos = torch.cos(freqs)
+#     freqs_sin = torch.sin(freqs)
+#     return freqs_cos, freqs_sin
 
-def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
-    ndim = x.ndim
-    assert 0 <= 1 < ndim
-    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
-    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
-    return freqs_cis.view(shape)
+# def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
+#     ndim = x.ndim
+#     assert 0 <= 1 < ndim
+#     assert freqs_cis.shape == (x.shape[1], x.shape[-1])
+#     shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
+#     return freqs_cis.view(shape)
 
-def apply_rotary_emb(
-    xq: torch.Tensor,
-    xk: torch.Tensor,
-    freqs_cos: torch.Tensor,
-    freqs_sin: torch.Tensor
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """ Applying rotary position embeddings to input tensors using the given frequency tensor
-    """
+# def apply_rotary_emb(
+#     xq: torch.Tensor,
+#     xk: torch.Tensor,
+#     freqs_cos: torch.Tensor,
+#     freqs_sin: torch.Tensor
+# ) -> Tuple[torch.Tensor, torch.Tensor]:
+#     """ Applying rotary position embeddings to input tensors using the given frequency tensor
+#     """
 
-    # reshape xq and xk to match the complex representation
-    xq_r, xq_i = xq.float().reshape(xq.shape[:-1] + (-1, 2)).unbind(-1)
-    xk_r, xk_i = xk.float().reshape(xk.shape[:-1] + (-1, 2)).unbind(-1)
+#     # reshape xq and xk to match the complex representation
+#     xq_r, xq_i = xq.float().reshape(xq.shape[:-1] + (-1, 2)).unbind(-1)
+#     xk_r, xk_i = xk.float().reshape(xk.shape[:-1] + (-1, 2)).unbind(-1)
 
-    # reshape freqs_cos and freqs_sin for broadcasting
-    freqs_cos = reshape_for_broadcast(freqs_cos, xq_r)
-    freqs_sin = reshape_for_broadcast(freqs_sin, xq_r)
+#     # reshape freqs_cos and freqs_sin for broadcasting
+#     freqs_cos = reshape_for_broadcast(freqs_cos, xq_r)
+#     freqs_sin = reshape_for_broadcast(freqs_sin, xq_r)
 
-    # apply rotation using real numbers
-    xq_out_r = xq_r * freqs_cos - xq_i * freqs_sin
-    xq_out_i = xq_r * freqs_sin + xq_i * freqs_cos
-    xk_out_r = xk_r * freqs_cos - xk_i * freqs_sin
-    xk_out_i = xk_r * freqs_sin + xk_i * freqs_cos
+#     # apply rotation using real numbers
+#     xq_out_r = xq_r * freqs_cos - xq_i * freqs_sin
+#     xq_out_i = xq_r * freqs_sin + xq_i * freqs_cos
+#     xk_out_r = xk_r * freqs_cos - xk_i * freqs_sin
+#     xk_out_i = xk_r * freqs_sin + xk_i * freqs_cos
 
-    # flatten last two dimensions
-    xq_out = torch.stack([xq_out_r, xq_out_i], dim=-1).flatten(3)
-    xk_out = torch.stack([xk_out_r, xk_out_i], dim=-1).flatten(3)
+#     # flatten last two dimensions
+#     xq_out = torch.stack([xq_out_r, xq_out_i], dim=-1).flatten(3)
+#     xk_out = torch.stack([xk_out_r, xk_out_i], dim=-1).flatten(3)
 
-    return xq_out.type_as(xq), xk_out.type_as(xk)
+#     return xq_out.type_as(xq), xk_out.type_as(xk)
+
+
+# CoPE
+class CoPE(nn.Module):
+
+    def __init__(self, npos_max, head_dim):
+        super().__init__()
+        self.npos_max = npos_max
+        self.pos_emb = nn.parameter.Parameter(
+                torch.zeros(1, head_dim, npos_max))
+
+    def forward(self, query, attn_logits):
+
+        gates = torch.sigmoid(attn_logits)
+        pos = gates.flip(-1).cumsum(dim=-1).flip(-1)
+
+        pos = pos.clamp(max = self.npos_max - 1)
+
+        pos_ceil = pos.ceil().long()
+        pos_floor = pos.floor().long()
+
+        logits_int = torch.matmul(query, self.pos_emb)
+        logits_ceil = logits_int.gather(-1, pos_ceil)
+        logits_floor = logits_int.gather(-1, pos_floor)
+
+        w = pos - pos_floor
+        return logits_ceil * w + logits_floor*(1-w)
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     """ Repeating the heads of keys and values to match the number of query heads
@@ -113,6 +141,7 @@ class Attention(nn.Module):
         self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
+        self.cope = CoPE(1000, self.head_dim)
         
         self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
         self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
@@ -145,7 +174,8 @@ class Attention(nn.Module):
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
 
-        xq, xk = apply_rotary_emb(xq, xk, freqs_cos, freqs_sin)
+        # RoPE
+        # xq, xk = apply_rotary_emb(xq, xk, freqs_cos, freqs_sin)
 
         # repeat k/v heads if n_kv_heads < n_heads
         xk = repeat_kv(xk, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
@@ -163,6 +193,8 @@ class Attention(nn.Module):
             assert hasattr(self, 'mask')
             scores = scores + self.mask[:, :, :seqlen, :seqlen]   # (bs, n_local_heads, seqlen, cache_len + seqlen)
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+            # CoPE
+            scores = self.cope(xq, scores)
             output = torch.matmul(scores, xv)  # (bs, n_local_heads, seqlen, head_dim)
         
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
